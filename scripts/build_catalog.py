@@ -6,7 +6,8 @@
 Для каждого фильма из списка FILMS (IMDb id) скрипт берёт из Wikidata:
 название (русская метка), год первой публикации (P577), длительность в
 минутах (P2047), страны производства (P495), языки оригинала (P364)
-и жанры (P136). Жанры и страны приводятся к коротким словам каталога
+и жанры (P136); тип фильма (P31) с анимацией даёт жанр «мультфильм».
+Жанры и страны приводятся к коротким словам каталога
 таблицей GENRES. Описания лежат в scripts/descriptions.json: это пересказ
 сюжета по-русски в одном-двух предложениях, год и длительность из них
 не берутся. Казахстанские фильмы из films_kz_example.json добавляются
@@ -17,6 +18,7 @@
 """
 
 import json
+import re
 import sys
 import urllib.parse
 import urllib.request
@@ -160,7 +162,6 @@ GENRES = {
     "научно-фантастический фильм ужасов": "ужасы",
     "психологический фильм ужасов": "ужасы",
     "фильм ужасов о сверхъестественном": "ужасы",
-    "фильм о привидениях": "ужасы",
     "фильм о монстрах": "ужасы",
     "боди-хоррор": "ужасы",
     "фильм ужасов о природе": "ужасы",
@@ -191,7 +192,7 @@ GENRES = {
     "рождественский фильм": "семейный",
 }
 # Жанры-обёртки без смысла для подбора: пропускаются молча.
-SKIP = {"фильм", "эпический фильм", "бадди-муви", "флешбэк-фильм", "независимый кинематограф",
+SKIP = {"фильм", "фильм о привидениях", "эпический фильм", "бадди-муви", "флешбэк-фильм", "независимый кинематограф",
         "фильм об американском футболе", "фильм в замкнутом пространстве", "girls with guns", "художественный фильм", "полнометражный фильм", "немое кино",
         "независимое кино", "чёрно-белый фильм", "фильм-экранизация",
         "экранизация литературного произведения", "ремейк", "фильм, основанный на реальных событиях",
@@ -204,6 +205,7 @@ SELECT ?imdb (SAMPLE(?ru) AS ?title_ru) (SAMPLE(?en) AS ?title_en)
        (GROUP_CONCAT(DISTINCT ?cl; separator="|") AS ?countries)
        (GROUP_CONCAT(DISTINCT ?ll; separator="|") AS ?languages)
        (GROUP_CONCAT(DISTINCT ?gl; separator="|") AS ?genres)
+       (GROUP_CONCAT(DISTINCT ?tl; separator="|") AS ?types)
        (SAMPLE(?film) AS ?item)
 WHERE {
   VALUES ?imdb { %s }
@@ -216,6 +218,7 @@ WHERE {
   OPTIONAL { ?film wdt:P495 ?c . ?c rdfs:label ?cl FILTER(LANG(?cl) = "ru") }
   OPTIONAL { ?film wdt:P364 ?l . ?l rdfs:label ?ll FILTER(LANG(?ll) = "ru") }
   OPTIONAL { ?film wdt:P136 ?g . ?g rdfs:label ?gl FILTER(LANG(?gl) = "ru") }
+  OPTIONAL { ?film wdt:P31 ?t . ?t rdfs:label ?tl FILTER(LANG(?tl) = "ru") }
 }
 GROUP BY ?imdb
 """
@@ -240,6 +243,7 @@ def fetch(imdb_ids):
             "countries": [x for x in (get("countries") or "").split("|") if x],
             "languages": [x.replace(" язык", "") for x in (get("languages") or "").split("|") if x],
             "genres_raw": [x for x in (get("genres") or "").split("|") if x],
+            "types": [x for x in (get("types") or "").split("|") if x],
             "item": get("item"),
         }
     return out
@@ -272,6 +276,9 @@ def main():
             problems.append(f"{fid} {imdb}: нет в Wikidata")
             continue
         genres = short_genres(row["genres_raw"])
+        # Анимация в Wikidata это тип фильма (P31), а не жанр: добавляем «мультфильм».
+        if any(re.search(r"анимац|мультфильм|аниме", t) for t in row["types"]):
+            genres.insert(0, "мультфильм")
         print(f"{fid} {imdb} {row['title']!r} ({row['title_en']}) {row['year']} "
               f"{row['minutes']} мин | {row['countries']} | {row['languages']} "
               f"| {genres}")

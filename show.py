@@ -46,11 +46,14 @@ def summary(rows):
         usd = sum(r.get("usd") or 0 for r in items)
         rejected = sum(len(r.get("rejected") or []) for r in items)
         priced = [r["usd"] for r in items if r.get("usd")]
+        steps = Counter(r.get("step", "choice") for r in items)
+        violations = sum(len(r.get("violations") or []) for r in items)
         print(f"\n{model}: {len(items)} вызовов ("
-              + ", ".join(f"{k} {v}" for k, v in outcomes.most_common()) + ")")
+              + ", ".join(f"{k} {v}" for k, v in outcomes.most_common()) + "); по шагам: "
+              + ", ".join(f"{k} {v}" for k, v in steps.most_common()))
         print(f"  токены: вход {total_in}, выход {total_out}, "
               f"из них рассуждения {total_reasoning}")
-        print(f"  отклонённых чужих id: {rejected}")
+        print(f"  отклонённых чужих id: {rejected}; фильмов не по условиям: {violations}")
         print(f"  стоимость: ${usd:.4f} всего"
               + (f", ${sum(priced) / len(priced):.5f} за вызов в среднем, "
                  f"10 000 запросов ≈ ${sum(priced) / len(priced) * 10_000:.2f}"
