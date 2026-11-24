@@ -213,3 +213,17 @@ def test_unknown_filter_words_are_ignored():
     assert kino.pick(stub, "m", "кино", FILMS) == ("ok", ["t-1"])
     for film in FILMS:   # условий не осталось, в выбор ушёл весь каталог
         assert json.dumps(film["title"], ensure_ascii=False) in stub.prompt("picks")
+
+
+def test_implausible_filter_numbers_are_dropped():
+    cleaned = kino.clean_filters(kino.Filters(max_minutes=-5, year_from=90, year_to=0), FILMS)
+    assert cleaned.model_dump(exclude_none=True) == {}
+    cleaned = kino.clean_filters(kino.Filters(year_from=2015, year_to=1990), FILMS)
+    assert cleaned.year_from is None and cleaned.year_to is None   # перевёрнутый диапазон
+
+
+def test_filter_words_keep_catalog_spelling():
+    films = [dict(FILMS[0], genres=["Драма"], languages=["Казахский"])]
+    cleaned = kino.clean_filters(kino.Filters(must_genres=["драма"], languages=["КАЗАХСКИЙ"]), films)
+    assert cleaned.must_genres == ["Драма"] and cleaned.languages == ["Казахский"]
+    assert kino.passes(films[0], cleaned)

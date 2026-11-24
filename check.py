@@ -108,10 +108,14 @@ def report_from_journal(items):
     """
     order = [item["query"] for item in items]
     expect = {item["query"]: item.get("expect") for item in items}
-    by_model, last_filters = {}, {}
+    by_model, last_filters, ignored = {}, {}, Counter()
     for row in sorted(journal_rows(), key=lambda r: r.get("time", "")):
         query = row["request"].get("query") if isinstance(row.get("request"), dict) else None
         if query not in expect:
+            # Строка не из набора: ручной запуск, опыт с памятью или запрос,
+            # который с тех пор переформулировали в queries.json.
+            if row.get("step") == "choice" and "filters" in row:
+                ignored[row.get("model")] += 1
             continue
         step = row.get("step", "choice")
         if step == "filters":
@@ -164,6 +168,9 @@ def report_from_journal(items):
               f"{rejected} | {violations} | {sum(seconds) / n:.1f} | ${sum(usd) / n:.4f} |"
               + (f" неполных: {partial} из {len(order)}" if partial else ""))
     print("\nСекунды и цена на запрос включают оба вызова; цена по прайсу платного доступа.")
+    if ignored:
+        print("Строк выбора с запросами не из queries.json (не учтены): "
+              + ", ".join(f"{m} {n}" for m, n in ignored.items()))
 
 
 def main():

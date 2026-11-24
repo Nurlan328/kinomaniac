@@ -170,9 +170,9 @@ def vocabulary(films):
     return genres, languages
 
 
-def filter_messages(query, films):
+def filter_messages(query, films, vocab=None):
     """Сообщения первого вызова: правила, списки слов каталога и запрос в тегах."""
-    genres, languages = vocabulary(films)
+    genres, languages = vocab or vocabulary(films)
     data = (f"<жанры>{json.dumps(genres, ensure_ascii=False)}</жанры>\n"
             f"<языки>{json.dumps(languages, ensure_ascii=False)}</языки>\n"
             f"<запрос>{query}</запрос>")
@@ -180,19 +180,34 @@ def filter_messages(query, films):
             {"role": "user", "content": data}]
 
 
-def clean_filters(filters, films):
-    """Оставляет в фильтрах только слова каталога; пустые условия становятся None."""
-    genres, languages = vocabulary(films)
+def clean_filters(filters, films, vocab=None):
+    """Оставляет в фильтрах только слова каталога и правдоподобные числа.
+
+    Слова сравниваются без учёта регистра, но возвращаются в написании
+    каталога: по ним потом идёт пересечение с жанрами и языками фильма.
+    Число вне разумных границ (отрицательная длительность, двузначный год)
+    считается отсутствием условия, иначе под фильтр не попал бы ни один фильм.
+    """
+    genres, languages = vocab or vocabulary(films)
 
     def words(values, allowed):
         if not values:
             return None
-        found = [w for w in dict.fromkeys(v.strip().lower() for v in values) if w in allowed]
+        original = {w.lower(): w for w in allowed}
+        found = [original[w] for w in dict.fromkeys(v.strip().lower() for v in values)
+                 if w in original]
         return found or None
 
-    return Filters(max_minutes=filters.max_minutes or None,
-                   year_from=filters.year_from or None,
-                   year_to=filters.year_to or None,
+    def number(value, low, high):
+        return value if value is not None and low <= value <= high else None
+
+    year_from = number(filters.year_from, 1888, 2100)
+    year_to = number(filters.year_to, 1888, 2100)
+    if year_from is not None and year_to is not None and year_from > year_to:
+        year_from = year_to = None
+    return Filters(max_minutes=number(filters.max_minutes, 10, 1000),
+                   year_from=year_from,
+                   year_to=year_to,
                    languages=words(filters.languages, languages),
                    exclude_genres=words(filters.exclude_genres, genres),
                    must_genres=words(filters.must_genres, genres))
@@ -302,14 +317,16 @@ def complete(client, model, messages, schema, effort=None):
 
 def ask_filters(client, model, query, films, effort=None):
     """Первый вызов: условия запроса. Возвращает (Filters или None, исход)."""
-    genres, languages = vocabulary(films)
+    vocab = vocabulary(films)
+    genres, languages = vocab
     request = {"query": query, "genres": genres, "languages": languages}
     started = time.time()
-    completion, failure = complete(client, model, filter_messages(query, films), Filters, effort)
+    completion, failure = complete(client, model, filter_messages(query, films, vocab),
+                                   Filters, effort)
     if failure:
         log(model, request, failure, started, completion, step="filters")
         return None, failure
-    filters = clean_filters(completion.choices[0].message.parsed, films)
+    filters = clean_filters(completion.choices[0].message.parsed, films, vocab)
     log(model, request, "ok", started, completion, step="filters",
         filters=filters.model_dump(exclude_none=True))
     return filters, "ok"

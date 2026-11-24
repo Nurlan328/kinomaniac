@@ -277,7 +277,8 @@ def main():
             continue
         genres = short_genres(row["genres_raw"])
         # Анимация в Wikidata это тип фильма (P31), а не жанр: добавляем «мультфильм».
-        if any(re.search(r"анимац|мультфильм|аниме", t) for t in row["types"]):
+        if any(re.search(r"анимац|мультфильм|аниме", t) for t in row["types"]) \
+                and "мультфильм" not in genres:
             genres.insert(0, "мультфильм")
         print(f"{fid} {imdb} {row['title']!r} ({row['title_en']}) {row['year']} "
               f"{row['minutes']} мин | {row['countries']} | {row['languages']} "

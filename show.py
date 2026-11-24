@@ -54,10 +54,13 @@ def summary(rows):
         print(f"  токены: вход {total_in}, выход {total_out}, "
               f"из них рассуждения {total_reasoning}")
         print(f"  отклонённых чужих id: {rejected}; фильмов не по условиям: {violations}")
+        # Запрос уровня Rare это два вызова (filters и choice): цена запроса
+        # считается по числу строк выбора, а не по числу строк журнала.
+        queries = steps.get("choice", 0)
         print(f"  стоимость: ${usd:.4f} всего"
-              + (f", ${sum(priced) / len(priced):.5f} за вызов в среднем, "
-                 f"10 000 запросов ≈ ${sum(priced) / len(priced) * 10_000:.2f}"
-                 if priced else ""))
+              + (f", ${sum(priced) / len(priced):.5f} за вызов в среднем" if priced else "")
+              + (f", ${usd / queries:.5f} за запрос, 10 000 запросов ≈ ${usd / queries * 10_000:.2f}"
+                 if queries else ""))
 
 
 def main():
