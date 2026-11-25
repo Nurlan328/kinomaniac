@@ -33,8 +33,9 @@ class SeqStub(Stub):
         return super().parse(**kwargs)
 
     def picks_prompts(self):
-        return ["\n".join(m["content"] for m in c["messages"])
-                for c in self.calls if c["kind"] == "picks"]
+        """Каталог и запрос из сообщения пользователя: системный промпт с примером
+        («Старик и степь» в примере совпадает с тестовым фильмом) не берётся."""
+        return [c["messages"][-1]["content"] for c in self.calls if c["kind"] == "picks"]
 
 
 @pytest.fixture(autouse=True)

@@ -79,6 +79,7 @@ INSTRUCTIONS = """Ты подбираешь фильмы из каталога �
 4. Условия запроса обязательны: «не про космос», «без ужасов», «до двух часов», «на казахском», «старое» и подобные ограничения отсекают фильмы, которые им не соответствуют. Длительность сверяй с minutes, язык с languages.
 5. Если в каталоге нет ничего подходящего, status no_match, picks пустой, причина по-русски в reason. Выдумывать или натягивать фильм ради ответа нельзя.
 6. Запрос может быть на русском или казахском. why и reason всегда по-русски.
+7. Если запрос слишком общий и по нему нельзя выбрать (нет ни жанра, ни темы, ни настроения, ни условия, например «посоветуй фильм» или «что посмотреть?»), status clarify, picks пустой, в reason один короткий уточняющий вопрос по-русски. Если в запросе есть хоть одна зацепка, подбирай, а не уточняй.
 
 Пример:
 <каталог>[{"id": "x-1", "title": "Старик и степь", "year": 2010, "minutes": 95, "genres": ["драма"], "countries": ["Казахстан"], "languages": ["казахский"], "description": "Чабан в буран один спасает отару от волков."}, {"id": "x-2", "title": "Ночной город", "year": 2018, "minutes": 150, "genres": ["боевик", "криминал"], "countries": ["США"], "languages": ["английский"], "description": "Детектив ищет убийцу в большом городе."}]</каталог>
@@ -113,8 +114,8 @@ class Pick(BaseModel):
 class Choice(BaseModel):
     """Схема ответа второго вызова: выбор фильмов."""
 
-    status: Literal["ok", "no_match"]   # нашлось или нет
-    reason: str                         # объяснение при no_match
+    status: Literal["ok", "no_match", "clarify"]   # нашлось, нет или нужен вопрос
+    reason: str                         # объяснение при no_match, вопрос при clarify
     picks: list[Pick]                   # от одного до трёх фильмов
 
 
@@ -345,7 +346,7 @@ def ask_filters(client, model, query, films, effort=None, mode=None):
 def pick(client, model, query, films, effort=None, mode=None):
     """Подбирает фильмы под запрос. Возвращает (исход, id показанных фильмов).
 
-    Исходы: ok, no_match, invalid, refusal, length, no_connection, error_<код>.
+    Исходы: ok, no_match, clarify, invalid, refusal, length, no_connection, error_<код>.
     При любом исходе, кроме ok, список id пустой. Печатает фильмы сама,
     данные берёт из переданного каталога, films.json не читает.
     mode помечает строки журнала уровня Epic: candidates или whole.
@@ -376,6 +377,10 @@ def pick(client, model, query, films, effort=None, mode=None):
         print("В каталоге ничего не подходит:", choice.reason or "без объяснения")
         log(model, request, "no_match", started, completion, filters=conditions)
         return "no_match", []
+    if choice.status == "clarify":   # SPEC B5, B7: вопрос вместо фильмов
+        print(choice.reason or "Уточните, пожалуйста: какой фильм вы ищете?")
+        log(model, request, "clarify", started, completion, filters=conditions)
+        return "clarify", []
 
     # Проверка кодом: чужой id отменяет весь ответ, пользователь его не видит.
     rejected = [p.film_id for p in choice.picks if str(p.film_id) not in known]

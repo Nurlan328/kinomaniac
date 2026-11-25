@@ -132,7 +132,7 @@ def test_prompt_has_tags_and_whole_catalog():
 
 
 def test_schema_error_is_invalid(journal):
-    stub = Stub({"status": "clarify", "reason": "?", "picks": []})
+    stub = Stub({"status": "maybe", "reason": "?", "picks": []})
     assert kino.pick(stub, "m", "что-то", FILMS) == ("invalid", [])
     assert rows(journal)[-1]["outcome"] == "invalid"
 

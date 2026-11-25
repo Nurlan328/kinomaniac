@@ -9,6 +9,7 @@
     uv run check.py --big --provider anthropic        Epic: 30 кандидатов, выбор моделью
     uv run check.py --big --whole --provider anthropic  Epic: весь каталог в промпте
     uv run check.py --report [--big]                  таблица сравнения по журналу
+    uv run check.py --report --stable 5               надёжность: прошли во всех пяти прогонах
 
 Запрос с ожиданием пройден, если исход совпал с ожиданием ("no_match": true
 или ok), в ответе есть хотя бы один id из must и нет ни одного из forbid.
@@ -111,7 +112,20 @@ def seconds_between(earlier, later):
         return float("inf")
 
 
-def report_from_journal(items, mode=None):
+def stability(runs, expect):
+    """SPEC B17: доля в одном прогоне (средняя) и доля запросов, прошедших во всех прогонах."""
+    if not runs:
+        return 0.0, 0.0
+    verdicts = [{r["request"]["query"]: bool(passed(expect[r["request"]["query"]], r["outcome"],
+                                                     r.get("shown") or []))
+                 for r in run} for run in runs]
+    single = sum(sum(v.values()) / len(v) for v in verdicts) / len(verdicts)
+    queries = list(verdicts[0])
+    stable = sum(all(v.get(q) for v in verdicts) for q in queries) / len(queries)
+    return single, stable
+
+
+def report_from_journal(items, mode=None, stable=None):
     """Таблица сравнения моделей по журналу, без вызовов модели.
 
     Берутся строки выбора (step choice) с полем filters, то есть прогоны уровня
@@ -158,6 +172,7 @@ def report_from_journal(items, mode=None):
         row = dict(row, seconds=(row.get("seconds") or 0) + (pre.get("seconds") or 0),
                    usd=(row.get("usd") or 0) + (pre.get("usd") or 0), tokens=tokens)
         by_model.setdefault(model, []).append(row)
+    stable_lines = []
     print("| Модель | Прогонов | Пройдено | Чужих id | Нарушений условий | Вход токенов/запрос "
           "| Сек/запрос | $/прогон |")
     print("|---|---|---|---|---|---|---|---|")
@@ -202,6 +217,17 @@ def report_from_journal(items, mode=None):
               f"{rejected} | {violations} | {sum(tokens) / n:,.0f} | {sum(seconds) / n:.1f} | "
               f"${sum(usd) / n:.4f} |"
               + (f" неполных: {partial} из {len(order)}" if partial else ""))
+        if stable and n >= stable:
+            last = complete[-stable:]
+            single, all_runs = stability(last, expect)
+            stable_lines.append(
+                f"| `{model}` | последние {stable} | {single * 100:.0f}% | {all_runs * 100:.0f}% "
+                f"({round(all_runs * len(order))} из {len(order)}) |")
+    if stable_lines:
+        print(f"\nНадёжность: последние {stable} полных прогонов каждой модели")
+        print("| Модель | Прогоны | Пройдено в одном прогоне (в среднем) | Пройдено во всех |")
+        print("|---|---|---|---|")
+        print("\n".join(stable_lines))
     print("\nТокены, секунды и цена на запрос включают оба вызова; цена по прайсу платного доступа.")
     if ignored:
         print("Строк выбора с запросами не из queries.json (не учтены): "
@@ -251,6 +277,8 @@ def main():
                         help="с --big: весь каталог в промпте вместо 30 кандидатов")
     parser.add_argument("--recall", action="store_true",
                         help="с --big: только отбор кандидатов, без модели")
+    parser.add_argument("--stable", type=int, metavar="N",
+                        help="с --report: доля запросов, прошедших во всех N последних прогонах")
     args = parser.parse_args()
     if (args.whole or args.recall) and not args.big:
         parser.error("--whole и --recall работают только вместе с --big")
@@ -260,7 +288,7 @@ def main():
         for mode in (("candidates", "whole") if args.big else (None,)):
             if mode:
                 print(f"\nРежим {mode}:")
-            report_from_journal(items, mode)
+            report_from_journal(items, mode, args.stable)
         return 0
     if args.recall:
         return recall(items, films)
