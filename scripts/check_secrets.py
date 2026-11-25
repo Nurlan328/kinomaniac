@@ -2,8 +2,8 @@
 
     uv run python scripts/check_secrets.py ФАЙЛ...
 
-Шаблоны те же, что ищет автопроверка курса: ключи OpenAI, Anthropic, Google и Groq.
-Файл .env в коммит не допускается вообще.
+Шаблоны те же, что ищет автопроверка курса (ключи OpenAI, Anthropic, Google, Groq),
+плюс токен Telegram-бота. Файл .env в коммит не допускается вообще.
 """
 
 import re
@@ -11,7 +11,8 @@ import sys
 from pathlib import Path
 
 KEY = re.compile(r"\b(sk-(?:proj-|svcacct-|ant-)?[A-Za-z0-9_\-]{20,}"
-                 r"|AIza[0-9A-Za-z_\-]{35}|gsk_[A-Za-z0-9]{40,})")
+                 r"|AIza[0-9A-Za-z_\-]{35}|gsk_[A-Za-z0-9]{40,}"
+                 r"|\d{8,10}:[A-Za-z0-9_\-]{35})")   # последний шаблон: токен Telegram-бота
 
 
 def main(paths):
