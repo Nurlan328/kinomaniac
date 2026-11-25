@@ -20,6 +20,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections import OrderedDict
 
 from dotenv import load_dotenv
 
@@ -33,10 +34,21 @@ HELP = ("Я подбираю фильмы из своего каталога: т
         "«уже смотрел Брат» — больше не предлагать этот фильм.\n"
         "/reset — начать заново.")
 MORE = re.compile(r"^\s*(давай\s+)?(ещё|еще|другие|другое|тағы)\W*$", re.IGNORECASE)
-EXCLUDE = re.compile(r"(?:уже\s+(?:смотрел[аи]?|видел[аи]?)|не\s+предлагай|не\s+советуй)\s+(.+)$"
+# Исключение только в начале сообщения (B11, B11a): внутри обычного запроса
+# «…но не советуй ужасы» эти слова остаются частью запроса.
+EXCLUDE = re.compile(r"^\s*(?:уже\s+(?:смотрел[аи]?|видел[аи]?)|не\s+предлагай|не\s+советуй)\s+(.+)$"
                      r"|^(.+?)\s+(?:көрдім|көргенмін)\W*$", re.IGNORECASE)
 RESET = {"/start", "/reset", "/help"}
 TELEGRAM = "https://api.telegram.org/bot{token}/{method}"
+MAX_CHATS = 1000   # B16b: сколько диалогов бот держит в памяти
+
+
+def explain_http(code):
+    """Понятная причина остановки для ответов Telegram, которые повтор не исправит (B16a)."""
+    return {401: "Telegram не принял токен (401): проверьте TELEGRAM_BOT_TOKEN в .env",
+            404: "Telegram не нашёл бота (404): проверьте TELEGRAM_BOT_TOKEN в .env",
+            409: "С этим токеном уже работает другой экземпляр бота (409): остановите его "
+                 "и запустите бота снова"}.get(code)
 
 
 class Dialog:
@@ -58,16 +70,21 @@ class Dialog:
         text = (text or "").strip()
         if not text:
             return HELP
-        if text.split()[0].lower() in RESET:                   # B14
+        # В групповом чате команда приходит как «/start@имя_бота» (B14).
+        if text.split()[0].split("@")[0].lower() in RESET:
             self.reset()
             return HELP
-        if MORE.match(text):                                    # B8, B9
+        if MORE.match(text):                                    # B8, B8a, B9
+            if self.pending:
+                return "Сначала ответьте на уточняющий вопрос или напишите новый запрос."
             if not self.last_query:
                 return "Сначала напишите запрос: какой фильм вы ищете?"
             return self.ask(self.last_query, more=True)
         match = EXCLUDE.search(text)
-        if match:                                               # B11, B12
-            return self.exclude((match.group(1) or match.group(2)).strip(" «»\"'.,!?"))
+        name = (match.group(1) or match.group(2)).strip(" «»\"'.,!?") if match else ""
+        # С запятой это уже не название, а запрос: «уже видела все комедии, хочу драму» (B11a).
+        if match and "," not in name and ";" not in name:      # B11, B12
+            return self.exclude(name)
         # Ответ на уточняющий вопрос продолжает исходный запрос (B6).
         query = f"{self.pending}. {text}" if self.pending else text
         self.pending = None
@@ -87,13 +104,19 @@ class Dialog:
         # pick сама печатает фильмы из каталога и сообщения об ошибках: бот отдаёт
         # пользователю ровно этот текст, поэтому показ не расходится с kino.py (B1, B15).
         with contextlib.redirect_stdout(printed):
-            outcome, ids = self.picker(self.client, self.model, query, films)
+            if self.picker is kino.pick_big:
+                # B16c: кандидаты отбираются по всему каталогу (индекс TF-IDF строится
+                # один раз), а показанные и исключённые убираются из кандидатов.
+                outcome, ids = kino.pick_big(self.client, self.model, query, self.films,
+                                             hidden=self.shown | self.excluded)
+            else:
+                outcome, ids = self.picker(self.client, self.model, query, films)
         text = printed.getvalue().strip()
         if outcome == "ok":
             self.shown |= {str(i) for i in ids}
             return text + "\n\nНапишите «ещё» для других фильмов или новый запрос."
-        if outcome == "clarify":                                # B5
-            self.pending = query
+        if outcome == "clarify":                                # B5, B8a
+            self.pending, self.last_query = query, None
             return text
         if outcome == "no_match" and more:                      # B10
             return "Больше ничего не подходит под этот запрос. Напишите новый."
@@ -125,11 +148,14 @@ class Chats:
 
     def __init__(self, client, model, films, picker=None):
         self.client, self.model, self.films, self.picker = client, model, films, picker
-        self.dialogs = {}
+        self.dialogs = OrderedDict()   # порядок: от давно неактивных к недавним
 
     def get(self, chat_id):
         if chat_id not in self.dialogs:
             self.dialogs[chat_id] = Dialog(self.client, self.model, self.films, self.picker)
+            while len(self.dialogs) > MAX_CHATS:                # B16b
+                self.dialogs.popitem(last=False)
+        self.dialogs.move_to_end(chat_id)
         return self.dialogs[chat_id]
 
     def reply(self, chat_id, text):
@@ -155,6 +181,13 @@ def serve(token, chats):
         try:
             updates = telegram(token, "getUpdates", {"timeout": 30, "offset": offset,
                                                      "allowed_updates": ["message"]})
+        except urllib.error.HTTPError as error:
+            # 401, 404, 409 повтор не исправит: бот останавливается с причиной (B16a).
+            if explain_http(error.code):
+                raise
+            print(f"Telegram ответил {error.code}, повтор через 5 с", flush=True)
+            time.sleep(5)
+            continue
         except (OSError, ValueError) as error:
             print("Telegram недоступен, повтор через 5 с:", type(error).__name__, flush=True)
             time.sleep(5)
@@ -204,7 +237,7 @@ def main(argv=None):
     except KeyboardInterrupt:
         print("Остановлен")
     except urllib.error.HTTPError as error:
-        print(f"Telegram ответил {error.code}: проверьте TELEGRAM_BOT_TOKEN")
+        print(explain_http(error.code) or f"Telegram ответил {error.code}: проверьте TELEGRAM_BOT_TOKEN")
         return 1
     return 0
 

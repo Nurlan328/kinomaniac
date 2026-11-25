@@ -114,11 +114,13 @@ def seconds_between(earlier, later):
 
 def stability(runs, expect):
     """SPEC B17: доля в одном прогоне (средняя) и доля запросов, прошедших во всех прогонах."""
-    if not runs:
-        return 0.0, 0.0
+    # Запросы без ожидания не входят ни в одну долю: им нечего проходить.
     verdicts = [{r["request"]["query"]: bool(passed(expect[r["request"]["query"]], r["outcome"],
                                                      r.get("shown") or []))
-                 for r in run} for run in runs]
+                 for r in run if expect.get(r["request"]["query"])} for run in runs]
+    verdicts = [v for v in verdicts if v]
+    if not verdicts:
+        return 0.0, 0.0
     single = sum(sum(v.values()) / len(v) for v in verdicts) / len(verdicts)
     queries = list(verdicts[0])
     stable = sum(all(v.get(q) for v in verdicts) for q in queries) / len(queries)
@@ -218,11 +220,12 @@ def report_from_journal(items, mode=None, stable=None):
               f"${sum(usd) / n:.4f} |"
               + (f" неполных: {partial} из {len(order)}" if partial else ""))
         if stable and n >= stable:
+            with_expect = sum(1 for q in order if expect.get(q))
             last = complete[-stable:]
             single, all_runs = stability(last, expect)
             stable_lines.append(
                 f"| `{model}` | последние {stable} | {single * 100:.0f}% | {all_runs * 100:.0f}% "
-                f"({round(all_runs * len(order))} из {len(order)}) |")
+                f"({round(all_runs * with_expect)} из {with_expect}) |")
     if stable_lines:
         print(f"\nНадёжность: последние {stable} полных прогонов каждой модели")
         print("| Модель | Прогоны | Пройдено в одном прогоне (в среднем) | Пройдено во всех |")

@@ -623,11 +623,18 @@ def candidates(query, films, k=K):
     return [film_id for _, _, film_id in scored[:k]]
 
 
-def pick_big(client, model, query, films, effort=None):
-    """Как pick, но модели уходят только кандидаты из candidates()."""
+def pick_big(client, model, query, films, effort=None, hidden=()):
+    """Как pick, но модели уходят только кандидаты из candidates().
+
+    hidden это id, которые не показываются (бот: уже показанные и «уже смотрел»).
+    Отбор идёт по всему каталогу, чтобы индекс TF-IDF не собирался заново, а
+    скрытые фильмы убираются из кандидатов; кандидатов при этом не меньше K.
+    """
+    hidden = {str(i) for i in hidden}
     # Кандидаты уходят модели в порядке отбора: лучшие совпадения первыми.
     by_id = {str(film["id"]): film for film in films}
-    subset = [by_id[str(i)] for i in candidates(query, films)]
+    found = [str(i) for i in candidates(query, films, K + len(hidden))]
+    subset = [by_id[i] for i in found if i not in hidden][:K]
     if not subset:
         print("Под условия запроса не подошёл ни один фильм каталога")
         log(model, {"query": query, "film_ids": [], "mode": "candidates"}, "no_match",

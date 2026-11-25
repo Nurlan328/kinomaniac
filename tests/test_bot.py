@@ -161,3 +161,68 @@ def test_b17_stability_share():
                         {"request": {"query": "b"}, "outcome": "no_match"}]
     single, stable = check.stability([run(True), run(False), run(True)], expect)
     assert single == pytest.approx(5 / 6) and stable == pytest.approx(1 / 2)
+
+
+# ---------- правки ревью: B8a, B11a, B14, B16a–c, B17 ----------
+
+def test_b8a_more_while_clarify_pending_asks_to_answer():
+    d, stub = dialog(answer(status="clarify", reason="Какой жанр?"))
+    d.handle("посоветуй что-нибудь")
+    calls = len(stub.calls)
+    reply = d.handle("ещё")
+    assert "вопрос" in reply.lower() and len(stub.calls) == calls
+
+
+def test_b11a_exclusion_words_inside_a_query_are_a_query():
+    for text in ("как Интерстеллар, но не советуй ужасы", "уже видела все комедии, хочу драму"):
+        d, stub = dialog(answer("t-1"))
+        assert title_in("t-1", d.handle(text)), text
+        assert not d.excluded and stub.picks_prompts()
+
+
+def test_b14_group_command_with_bot_name_resets():
+    d, stub = dialog()
+    d.handle("уже смотрел Дом у моря")
+    d.handle("/reset@kinomaniac_nurlan_bot")
+    assert not d.excluded and stub.calls == []
+
+
+def test_b16a_unauthorized_or_conflict_stops_polling(monkeypatch, capsys):
+    import io
+    import urllib.error
+
+    for code, word in ((401, "токен"), (409, "экземпляр")):
+        def fake(token, method, payload, timeout=40, code=code):
+            if method == "getMe":
+                return {"result": {"username": "test_bot"}}
+            raise urllib.error.HTTPError("url", code, "error", {}, io.BytesIO(b"{}"))
+        monkeypatch.setattr(bot, "telegram", fake)
+        with pytest.raises(urllib.error.HTTPError):
+            bot.serve("token", bot.Chats(Stub(), "m", FILMS))
+        assert bot.explain_http(code) and word in bot.explain_http(code)
+
+
+def test_b16b_chats_are_bounded(monkeypatch):
+    monkeypatch.setattr(bot, "MAX_CHATS", 3)
+    chats = bot.Chats(Stub(), "m", FILMS)
+    for chat_id in range(5):
+        chats.get(chat_id)
+    assert list(chats.dialogs) == [2, 3, 4]
+
+
+def test_b16c_big_mode_keeps_index_and_hides_shown(monkeypatch):
+    calls = []
+    monkeypatch.setattr(kino, "index", lambda films, real=kino.index: calls.append(id(films)) or real(films))
+    stub = SeqStub(answer("t-1"), answer("t-3"))
+    d = bot.Dialog(stub, "m", FILMS, kino.pick_big)
+    d.handle("кино")
+    d.handle("ещё")
+    assert len(set(calls)) == 1                           # один и тот же каталог, индекс не пересобран
+    assert "Старик и степь" not in stub.picks_prompts()[-1]
+
+
+def test_b17_queries_without_expect_are_not_counted():
+    expect = {"a": {"must": ["t-1"]}, "free": None}
+    run = [{"request": {"query": "a"}, "outcome": "ok", "shown": ["t-1"]},
+           {"request": {"query": "free"}, "outcome": "ok", "shown": ["t-2"]}]
+    assert check.stability([run, run], expect) == (1.0, 1.0)
