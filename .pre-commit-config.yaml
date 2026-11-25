@@ -1,0 +1,16 @@
+# Хук перед каждым коммитом: проверка ключей и тесты с заглушкой вместо модели.
+# Установка один раз: uv run pre-commit install
+repos:
+  - repo: local
+    hooks:
+      - id: no-api-keys
+        name: ключи API не попадают в коммит
+        entry: uv run --frozen python scripts/check_secrets.py
+        language: system
+        pass_filenames: true
+      - id: pytest
+        name: pytest с заглушкой вместо модели
+        entry: uv run --frozen pytest -q
+        language: system
+        pass_filenames: false
+        always_run: true

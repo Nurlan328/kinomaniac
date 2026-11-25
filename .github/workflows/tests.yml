@@ -1,0 +1,19 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Окружение из uv.lock
+        run: uv sync --locked
+      # Тесты работают с заглушкой вместо клиента модели: ключ API и сеть не нужны.
+      - name: pytest с заглушкой вместо модели
+        run: uv run pytest -q
+        env:
+          PYTHONUTF8: "1"
