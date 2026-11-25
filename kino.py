@@ -18,7 +18,9 @@ invalid, отклонённые id в журнале calls.jsonl; фильм, н
 
 import argparse   # разбор аргументов командной строки
 import json       # каталог в промпт и строки журнала
+import math       # TF-IDF для отбора кандидатов на уровне Epic
 import os         # ключи провайдеров из переменных окружения
+import re         # разбор условий запроса правилами и разбиение на слова
 import sys        # вывод и код возврата
 import time       # отметка времени и длительность вызова
 from pathlib import Path
@@ -59,6 +61,9 @@ PRICE = {"gpt-6-luna": (0.10, 0.50), "gpt-6-astra": (10.00, 50.00),
          "gemini-3.5-flash-lite": (0.30, 2.50), "qwen3.5:4b": (0.0, 0.0)}
 # Сколько модель рассуждает: у gpt-oss выключить нельзя, минимум low.
 EFFORT = {"openai/gpt-oss-120b": "low", "openai/gpt-oss-20b": "low"}
+# Длинный промпт дороже: у Haiku 5.5 промпт больше 100K токенов идёт по другой цене.
+# (порог входных токенов, цена входа, цена выхода)
+PRICE_LONG = {"claude-haiku-5-5": (100_000, 0.50, 2.50)}
 # Журнал: путь можно подменить переменной окружения, чтобы два прогона
 # на разных моделях шли параллельно в разные файлы, а потом склеились.
 JOURNAL = Path(os.environ.get("KINO_JOURNAL", "calls.jsonl"))
@@ -266,6 +271,9 @@ def log(model, request, outcome, started, completion=None, step="choice", **extr
     usage = getattr(completion, "usage", None)
     if usage is not None:
         price_in, price_out = PRICE.get(model, (0.0, 0.0))
+        threshold, long_in, long_out = PRICE_LONG.get(model, (None, 0, 0))
+        if threshold is not None and usage.prompt_tokens > threshold:
+            price_in, price_out = long_in, long_out
         row["id"] = getattr(completion, "id", None)
         row["usage"] = usage.model_dump()
         row["usd"] = (usage.prompt_tokens * price_in
@@ -315,11 +323,13 @@ def complete(client, model, messages, schema, effort=None):
     return completion, None
 
 
-def ask_filters(client, model, query, films, effort=None):
+def ask_filters(client, model, query, films, effort=None, mode=None):
     """Первый вызов: условия запроса. Возвращает (Filters или None, исход)."""
     vocab = vocabulary(films)
     genres, languages = vocab
     request = {"query": query, "genres": genres, "languages": languages}
+    if mode:
+        request["mode"] = mode   # отчёт по журналу связывает фильтры и выбор одного прогона
     started = time.time()
     completion, failure = complete(client, model, filter_messages(query, films, vocab),
                                    Filters, effort)
@@ -332,29 +342,32 @@ def ask_filters(client, model, query, films, effort=None):
     return filters, "ok"
 
 
-def pick(client, model, query, films, effort=None):
+def pick(client, model, query, films, effort=None, mode=None):
     """Подбирает фильмы под запрос. Возвращает (исход, id показанных фильмов).
 
     Исходы: ok, no_match, invalid, refusal, length, no_connection, error_<код>.
     При любом исходе, кроме ok, список id пустой. Печатает фильмы сама,
     данные берёт из переданного каталога, films.json не читает.
+    mode помечает строки журнала уровня Epic: candidates или whole.
     """
     known = {str(film["id"]): film for film in films}   # id → запись каталога
 
-    filters, failure = ask_filters(client, model, query, films, effort)
+    filters, failure = ask_filters(client, model, query, films, effort, mode)
     if filters is None:
         return failure, []
-    candidates = [film for film in films if passes(film, filters)]
+    passing = [film for film in films if passes(film, filters)]
     conditions = filters.model_dump(exclude_none=True)
-    request = {"query": query, "film_ids": [film["id"] for film in candidates],
+    request = {"query": query, "film_ids": [film["id"] for film in passing],
                "filters": conditions}
+    if mode:
+        request["mode"] = mode
     started = time.time()
-    if not candidates:
+    if not passing:
         print(f"По условиям запроса ({describe(filters)}) в каталоге ничего нет")
         log(model, request, "no_match", started, filters=conditions)
         return "no_match", []
 
-    completion, failure = complete(client, model, messages_for(query, candidates), Choice, effort)
+    completion, failure = complete(client, model, messages_for(query, passing), Choice, effort)
     if failure:
         log(model, request, failure, started, completion, filters=conditions)
         return failure, []
@@ -401,15 +414,242 @@ def pick(client, model, query, films, effort=None):
     return "ok", ids
 
 
+# ---------- Epic: каталог больше разумного промпта ----------
+#
+# Каталог из 1000+ фильмов в промпт не кладётся. candidates() отбирает 30
+# кандидатов без языковой модели: условия из запроса разбираются правилами
+# (длительность, годы, язык, жанры), остальное решает поиск по словам
+# описаний и названий (TF-IDF из лекции 1 с грубым отсечением окончаний).
+# Датасет русскоязычный, поэтому русский запрос находит русское описание.
+# pick_big() отдаёт модели только кандидатов, проверки те же, что в pick().
+
+BIG_CATALOG = Path("films_big.json")
+K = 30
+STOP = set("""фильм фильмы кино кинофильм картина что чтобы который которая которые какой какая
+какие нибудь посмотреть посмотрим смотреть хочу хотим можно надо нужно про для на в во с со о об
+от до из за по к у и а но или не ни без кроме только же ли бы это этот эта эти тот та те он она
+они его её их мне нам вечер вечером выходные вечера год года лет годов когда где как очень самый
+самая самое самые ещё еще уже чем чтобы есть был была было были будет лучше хороший хорошая
+хорошее отличный интересный классный крутой новый старый длинный короткий""".split())
+# Казахские слова запроса, у которых есть прямой аналог среди слов каталога.
+KAZAKH = {"комедия": "комедия", "тарихи": "исторический", "криминалды": "криминал",
+          "қылмыстық": "криминал", "отбасылық": "семейный", "отбасымен": "семейный",
+          "мультфильм": "мультфильм", "анимация": "мультфильм", "драма": "драма",
+          "махаббат": "мелодрама", "соғыс": "военный", "фантастика": "фантастика",
+          "қорқынышты": "ужасы", "детектив": "детектив", "боевик": "боевик",
+          "музыкалық": "музыкальный", "балалар": "семейный", "шытырман": "приключения"}
+SUFFIXES = ("иями", "ями", "ами", "ого", "его", "ому", "ему", "ыми", "ими", "ях", "ах", "ям",
+            "ам", "ов", "ев", "ей", "ой", "ый", "ий", "ая", "яя", "ое", "ее", "ые", "ие", "ом",
+            "ем", "ую", "юю", "ы", "и", "а", "я", "о", "е", "у", "ю", "ь")
+_INDEX = {}
+
+
+def stem(word):
+    """Грубое отсечение русского окончания: «фильмами» → «фильм», «луну» → «лун»."""
+    for suffix in SUFFIXES:
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            return word[: -len(suffix)]
+    return word
+
+
+def tokens(text):
+    # «ё» и «е» в описаниях пишут по-разному: «полёт» и «полет» должны совпадать.
+    words = re.findall(r"[а-яёa-zәғқңөұүһі]+", text.lower().replace("ё", "е"))
+    return [stem(KAZAKH.get(w, w)) for w in words if w not in STOP and len(w) > 2]
+
+
+def negated(query):
+    """Слова темы после «не про», «но не», «без», «кроме»: «не про космос» → {«космос»}.
+
+    Жанры среди них уже стали exclude_genres; остальные слова отбор кандидатов
+    не берёт в запрос и штрафует фильмы, в карточке которых они есть.
+    """
+    found = set()
+    for m in re.finditer(r"(?:\bне\s+(?:про|о|об)|\bно\s+не|\bбез|\bкроме)\s+([а-яёәғқңөұүһі\s]+)",
+                         query.lower()):
+        found.update(tokens(" ".join(m.group(1).split()[:2])))
+    return found
+
+
+def rule_filters(query, films, vocab=None):
+    """Условия запроса без модели: те же поля Filters, но по правилам."""
+    genres, languages = vocab or vocabulary(films)
+    text = query.lower()
+    filters = Filters()
+    if m := re.search(r"до\s+(\d+)\s*мин|(\d+)\s*минут\w*\s+аз|короче\s+(\d+)", text):
+        filters.max_minutes = int(next(x for x in m.groups() if x))
+    elif re.search(r"до\s+(двух|2)\s*час|до\s+2\s*ч", text):
+        filters.max_minutes = 120
+    elif re.search(r"до\s+полутора\s+час", text):
+        filters.max_minutes = 90
+    elif re.search(r"\bкоротк|қысқа", text):
+        filters.max_minutes = 100
+    if m := re.search(r"(?:до|раньше)\s+(\d{4})\s*года", text):
+        filters.year_to = int(m.group(1)) - 1
+    elif m := re.search(r"(?:после|с|новее)\s+(\d{4})\s*года", text):
+        filters.year_from = int(m.group(1))
+    elif m := re.search(r"(\d{4})-х", text):
+        filters.year_from, filters.year_to = int(m.group(1)), int(m.group(1)) + 9
+    elif m := re.search(r"(?<!\d)([1-9]0)-х", text):   # «90-х» → 1990–1999
+        filters.year_from, filters.year_to = 1900 + int(m.group(1)), 1909 + int(m.group(1))
+    elif re.search(r"девяност", text):
+        filters.year_from, filters.year_to = 1990, 1999
+    elif re.search(r"восьмидесят", text):
+        filters.year_from, filters.year_to = 1980, 1989
+    # Только формы прилагательных: «старшеклассник», «старик», «новогодний» годом не считаются.
+    elif re.search(r"\bстар(ое|ый|ые|ого|ых|ом|ой|ую|ая|енькое|енький)\b|классик|советск|кеңес",
+                   text):
+        filters.year_to = 1991
+    elif re.search(r"\bнов(ое|ый|ые|ого|ых|ом|ой|ую|ая|инк\w*)\b|свеж|последних лет|жаңа", text):
+        filters.year_from = 2015
+    for word, language in (("казахск", "казахский"), ("қазақ", "казахский"),
+                           ("русск", "русский"), ("орыс", "русский"),
+                           ("японск", "японский"), ("корейск", "корейский"),
+                           ("французск", "французский"), ("английск", "английский"),
+                           ("итальянск", "итальянский"), ("испанск", "испанский"),
+                           ("немецк", "немецкий"), ("ағылшын", "английский")):
+        # «на казахском», «казахский язык», «казахском», «қазақ тілінде», «қазақша»
+        if re.search(rf"\bна\s+{word}|{word}\w*\s+(тіл|язык)|{word}ом\b|{word}ша\b", text) \
+                and language in languages:
+            filters.languages = [language]
+            break
+    # Жанр после «не», «без», «кроме» исключается, остальные найденные жанры обязательны.
+    # Слово и жанр сравниваются по началу основы: «комедий» и «комедия» дают
+    # разные окончания, но одно начало «комед».
+    prefixes = {stem(g)[:5]: g for g in genres}
+    exclude, must = [], []
+    last_end, last_negated = None, False
+    for match in re.finditer(r"[а-яёa-zәғқңөұүһі]+", text):
+        word = stem(KAZAKH.get(match.group(), match.group()))
+        genre = prefixes.get(word[:5]) if len(word) >= 4 else None
+        if genre is None:
+            continue
+        before = text[max(0, match.start() - 12):match.start()]
+        negative = bool(re.search(r"(^|\s)(не|без|кроме|емес|жоқ)\s*$", before))
+        # «без ужасов и триллеров», «кроме комедий, мелодрам»: отрицание тянется по списку.
+        if not negative and last_negated and last_end is not None \
+                and re.fullmatch(r"\s*(,|и|или)\s*", text[last_end:match.start()]):
+            negative = True
+        (exclude if negative else must).append(genre)
+        last_end, last_negated = match.end(), negative
+    filters.exclude_genres = exclude or None
+    filters.must_genres = [g for g in must if g not in exclude] or None
+    return clean_filters(filters, films, (genres, languages))
+
+
+def index(films):
+    """TF-IDF по названию, жанрам, странам и описанию; строится один раз на каталог."""
+    # Кеш держит сам список: id() освобождённого списка может достаться другому.
+    cached = _INDEX.get("films")
+    if cached is films and _INDEX.get("size") == len(films):
+        return _INDEX["value"]
+    docs, df = [], {}
+    for film in films:
+        words = tokens(" ".join([film.get("title", ""), " ".join(film.get("genres") or []),
+                                 " ".join(film.get("countries") or []),
+                                 film.get("description", "")]))
+        counts = {}
+        for w in words:
+            counts[w] = counts.get(w, 0) + 1
+        for w in counts:
+            df[w] = df.get(w, 0) + 1
+        docs.append(counts)
+    n = max(len(films), 1)
+    idf = {w: math.log((1 + n) / (1 + d)) + 1 for w, d in df.items()}
+    vectors = []
+    for counts in docs:
+        vec = {w: (1 + math.log(c)) * idf[w] for w, c in counts.items()}
+        norm = math.sqrt(sum(v * v for v in vec.values())) or 1.0
+        vectors.append({w: v / norm for w, v in vec.items()})
+    _INDEX.update(films=films, size=len(films), value=(vectors, idf))
+    return _INDEX["value"]
+
+
+def candidates(query, films, k=K):
+    """До k id фильмов под запрос, без языковой модели.
+
+    Сначала условия по полям (rule_filters): исключённые жанры, язык,
+    длительность и годы отсекают фильмы, а названные жанры только поднимают
+    фильм в списке, потому что правило по началу слова может принять тему
+    («музыкант», «история») за жанр. Затем косинусная близость TF-IDF запроса
+    и карточки фильма. Если запрос ссылается на фильм из каталога («как
+    Интерстеллар», «похожее на «Начало»»), его жанры и описание добавляются к
+    запросу, а сам фильм в кандидаты не попадает. Без совпадений по словам
+    кандидаты идут в порядке каталога (самые известные первыми).
+    """
+    vectors, idf = index(films)
+    filters = rule_filters(query, films)
+    hard = filters.model_copy(update={"must_genres": None})
+    text = query.lower()
+    expansion, excluded = [], set()
+    for film in films:
+        name = str(film.get("title", ""))
+        title = re.escape(name.lower())
+        # Ссылка на фильм только после «как», «похож…», «вроде», «типа» или в кавычках:
+        # иначе название-слово («Любовь») выкидывало бы фильм из запроса о любви.
+        # Короткое название («Она», «Брат») после «как» считается ссылкой, только если
+        # в запросе оно с заглавной буквы: «как она любит» это не «Она».
+        after_word = rf"\b(как|похож\w*|вроде|типа|наподобие)\s+(на\s+)?[«\"]?{title}(\W|$)"
+        if len(name) < 5 and not re.search(rf"(?<![а-яё]){re.escape(name)}(?![а-яё])", query):
+            after_word = r"(?!)"
+        if len(name) >= 3 and re.search(rf"({after_word})|([«\"]{title}[»\"])", text):
+            expansion += film.get("genres") or []
+            expansion.append(film.get("description", ""))
+            excluded.add(str(film["id"]))
+    avoid = negated(query)
+    words = [w for w in tokens(query + " " + " ".join(expansion)) if w not in avoid]
+    counts = {}
+    for w in words:
+        counts[w] = counts.get(w, 0) + 1
+    q = {w: (1 + math.log(c)) * idf.get(w, 0) for w, c in counts.items()}
+    # Отрицательная часть запроса: «не про космос» опускает фильмы о космосе.
+    for w in avoid:
+        q[w] = -2 * idf.get(w, 0)
+    wanted = set(filters.must_genres or [])
+    scored = []
+    for position, (film, vec) in enumerate(zip(films, vectors)):
+        if str(film["id"]) in excluded or not passes(film, hard):
+            continue
+        score = sum(weight * vec.get(w, 0) for w, weight in q.items())
+        if wanted & set(film.get("genres") or []):
+            score += 0.5   # названный жанр поднимает фильм, но не отсекает остальные
+        scored.append((-score, position, film["id"]))
+    scored.sort()
+    return [film_id for _, _, film_id in scored[:k]]
+
+
+def pick_big(client, model, query, films, effort=None):
+    """Как pick, но модели уходят только кандидаты из candidates()."""
+    # Кандидаты уходят модели в порядке отбора: лучшие совпадения первыми.
+    by_id = {str(film["id"]): film for film in films}
+    subset = [by_id[str(i)] for i in candidates(query, films)]
+    if not subset:
+        print("Под условия запроса не подошёл ни один фильм каталога")
+        log(model, {"query": query, "film_ids": [], "mode": "candidates"}, "no_match",
+            time.time(), filters={})
+        return "no_match", []
+    return pick(client, model, query, subset, effort, mode="candidates")
+
+
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description="Подбор фильма из каталога")
     parser.add_argument("query", help="запрос зрителя, на русском или казахском")
+    parser.add_argument("--big", action="store_true",
+                        help=f"каталог {BIG_CATALOG}: {K} кандидатов отбирает код, выбирает модель")
     add_model_args(parser)
     args = parser.parse_args()
-    films = json.loads(CATALOG.read_text(encoding="utf-8"))
     client, model = client_from_args(args)
-    outcome, _ = pick(client, model, args.query, films)
+    if args.big:
+        if not BIG_CATALOG.exists():
+            print(f"Нет {BIG_CATALOG}: соберите его командой "
+                  "uv run scripts/build_big_catalog.py all")
+            return 1
+        films = json.loads(BIG_CATALOG.read_text(encoding="utf-8"))
+        outcome, _ = pick_big(client, model, args.query, films)
+    else:
+        films = json.loads(CATALOG.read_text(encoding="utf-8"))
+        outcome, _ = pick(client, model, args.query, films)
     return 0 if outcome in ("ok", "no_match") else 1
 
 
